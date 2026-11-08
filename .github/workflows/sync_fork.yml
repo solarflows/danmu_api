@@ -1,44 +1,69 @@
 name: Fork Sync
 
 permissions:
-    contents: write
+  contents: write
 
 on:
-    schedule:
-        - cron: "0 0 * * *"  # 每天午夜执行
-    workflow_dispatch:  # 允许手动触发
+  schedule:
+    - cron: "0 0 * * *"  # 每天午夜执行
+  workflow_dispatch:  # 允许手动触发
 
 jobs:
-    sync_with_upstream:
-        name: Sync with Upstream
-        runs-on: ubuntu-latest
-        if: ${{ github.event.repository.fork }}
+  sync_with_upstream:
+    name: Sync with Upstream
+    runs-on: ubuntu-latest
+    if: ${{ github.event.repository.fork }}
 
-        steps:
-            - name: Checkout target repo
-              uses: actions/checkout@v5
-              with:
-                token: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout target repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
 
-            - name: Sync Upstream
-              uses: aormsby/Fork-Sync-With-Upstream-action@v3.4.3
-              with:
-                  target_repo_token: ${{ secrets.GITHUB_TOKEN }}
-                  upstream_sync_repo: huangxd-/danmu_api
-                  upstream_sync_branch: main
-                  target_sync_branch: main
-                  test_mode: false
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
-            - name: Check for new commits
-              if: success()
-              run: echo "Sync completed successfully"
+      - name: Sync upstream with workflow shield
+        run: |
+          git remote add upstream https://github.com/huangxd-/danmu_api.git || git remote set-url upstream https://github.com/huangxd-/danmu_api.git
+          git fetch upstream main
 
-            - name: Check for Failure
-              if: failure()
-              run: |
-                  echo "[Error] Sync failed. This might be due to:"
-                  echo "1. Changes in the upstream workflow file"
-                  echo "2. Merge conflicts that need manual resolution"
-                  echo "3. Network issues"
-                  echo "Please check the logs and consider manual sync if needed."
-                  exit 1
+          UPSTREAM_SHA=$(git rev-parse upstream/main)
+          if git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD; then
+            echo "Upstream main is already merged into local branch. Nothing to do."
+            exit 0
+          fi
+
+          echo "Attempting merge upstream ($UPSTREAM_SHA) without committing..."
+          # 尝试合并上游提交，停止在提交前以便过滤工作流变动
+          git merge --no-ff --no-commit -m "merge: sync upstream ($UPSTREAM_SHA) with workflow shield" upstream/main || {
+            echo "::warning::Merge conflict encountered, resolving automatically on protected paths..."
+          }
+
+          # 【核心防线 · 加盾】：强制锁定并恢复本仓库的 CI/工作流文件，杜绝上游 CI 污染
+          echo "Applying CI shield: restoring and preserving local .github/workflows..."
+          git checkout HEAD -- .github/workflows/ 2>/dev/null || true
+          git reset HEAD -- .github/workflows/ 2>/dev/null || true
+          git clean -fd .github/workflows/ 2>/dev/null || true
+
+          # 熔断检查：除工作流外是否存在未解决的实质性业务代码冲突
+          REMAINING_CONFLICTS=$(git diff --name-only --diff-filter=U)
+          if [ -n "$REMAINING_CONFLICTS" ]; then
+            echo "::error::Substantive code conflict in files: $REMAINING_CONFLICTS. Aborting merge."
+            git merge --abort
+            exit 1
+          fi
+
+          # 检查除工作流以外是否有实质代码更新
+          if git diff --cached --quiet; then
+            echo "::notice::Upstream only contained workflow changes; no code updates outside workflows. Skipping merge commit."
+            git merge --abort 2>/dev/null || true
+            exit 0
+          fi
+
+          git commit -m "merge: sync upstream ($UPSTREAM_SHA) [shield: workflows preserved]"
+          git push origin main
+          echo "Successfully synced upstream code while shielding .github/workflows."
